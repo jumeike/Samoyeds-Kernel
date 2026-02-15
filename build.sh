@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # install dev tools
-apt install -y libgoogle-glog-dev libboost-all-dev
+#apt install -y libgoogle-glog-dev libboost-all-dev
 
 # unarchive cusparselt
 cd cusparselt && {
@@ -32,11 +32,11 @@ mkdir -p build
 cd build && {
   echo "Building Samoyeds-Kernel"
   rm -rf *
-  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="$CUDA_COMPUTE_CAPABILITY"
+  cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=$CUDACXX -DCMAKE_CUDA_ARCHITECTURES="$CUDA_COMPUTE_CAPABILITY"
   make -j
 } && cd ..
 
 # build baselines
-cd benchmark/third_party/venom && {
-  ./scripts/build.sh
-} && cd ../../../
+#cd benchmark/third_party/venom && {
+#  ./scripts/build.sh
+#} && cd ../../../

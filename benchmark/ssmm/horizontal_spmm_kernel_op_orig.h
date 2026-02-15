@@ -48,22 +48,19 @@ __global__ void _HorizontalSpmmSparseWeightedTransKernel(const int m, const int 
                                                          const half *routing_weights, const half *C, half *D) {
     KernelType kernel;
     extern __shared__ half shared_mem_workspace[];
-    kernel.mainLoopTransWeightDot(m, n, k, 0, 0, // logical N, M not needed here
-                    A_values, A_metadata, A_indices, B, routing_weights,
+    kernel.mainLoopTransWeightDot(m, n, k, A_values, A_metadata, A_indices, B, routing_weights,
                     shared_mem_workspace);
     kernel.epilogueSparseTrans(m, n, B_indices, B_indices_len, routing_weights, D, shared_mem_workspace);
 }
 
 template<typename KernelType>
 __global__ void _HorizontalSpmmDenseWeightedTransKernel(const int m, const int n, const int k,
-                                                        const int logical_N, const int logical_M, //JU
                                                  const half *A_values, const uint *A_metadata, const uint *A_indices,
                                                  const half *B,
                                                  const half *routing_weights, const half *C, half *D) {
     KernelType kernel;
     extern __shared__ half shared_mem_workspace[];
-    kernel.mainLoopTransWeightDot(m, n, k, logical_N, logical_M, // pass logical N, M to kernel    
-                                A_values, A_metadata, A_indices, B, routing_weights,
+    kernel.mainLoopTransWeightDot(m, n, k, A_values, A_metadata, A_indices, B, routing_weights,
                                shared_mem_workspace);
     kernel.epilogueDenseTrans(m, n, D, shared_mem_workspace);
 }
@@ -85,6 +82,9 @@ void HorizontalSpmmKernelExec(const int m, const int n, const int k,
     cudaStream_t stream = NULL;
     int dim_x = m / KernelType::Block_M / M * N;
     int dim_y = n / KernelType::Block_N;
+    printf("[HorizontalSpmmKernelExec] N=%d, M=%d\n", N, M);
+    printf("[LAUNCH SPMM KERNEL] shared_mem=%zu, Block_M=%d, Block_N=%d, m=%d, n=%d, k=%d, dim_x=%d, dim_y=%d\n",
+       shared_mem_size, KernelType::Block_M, KernelType::Block_N, m, n, k, dim_x, dim_y);
     _HorizontalSpmmKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
             m, n, k, A_values, A_metadata, A_indices, B, C, D);
 }
@@ -106,6 +106,9 @@ void HorizontalSpmmTransKernelExec(const int m, const int n, const int k,
     cudaStream_t stream = NULL;
     int dim_x = m / KernelType::Block_M / M * N;
     int dim_y = n / KernelType::Block_N;
+    printf("[HorizontalSpmmTransKernelExec] N=%d, M=%d\n", N, M);
+    printf("[LAUNCH SPMM KERNEL] shared_mem=%zu, Block_M=%d, Block_N=%d, m=%d, n=%d, k=%d, dim_x=%d, dim_y=%d\n",
+       shared_mem_size, KernelType::Block_M, KernelType::Block_N, m, n, k, dim_x, dim_y);
     _HorizontalSpmmTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
             m, n, k, A_values, A_metadata, A_indices, B, C, D);
 }
@@ -129,6 +132,9 @@ void HorizontalSpmmSparseWeightedTransKernelExec(const int m, const int n, const
     cudaStream_t stream = NULL;
     int dim_x = m / KernelType::Block_M / M * N;
     int dim_y = n / KernelType::Block_N;
+    printf("[HorizontalSpmmSparseWeightedTransKernelExec] N=%d, M=%d\n", N, M);
+    printf("[LAUNCH SPMM KERNEL] shared_mem=%zu, Block_M=%d, Block_N=%d, m=%d, n=%d, k=%d, dim_x=%d, dim_y=%d\n",
+       shared_mem_size, KernelType::Block_M, KernelType::Block_N, m, n, k, dim_x, dim_y);
     _HorizontalSpmmSparseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
             m, n, k, A_values, A_metadata, A_indices, B, B_indices, B_indices_len, routing_weights, C, D);
 }
@@ -146,42 +152,17 @@ void HorizontalSpmmDenseWeightedTransKernelExec(const int m, const int n, const 
     using BSwizzle = Swizzle8BWiseXor;
     using CSwizzle = Swizzle8BWiseXor;
 
-//     using KernelType = HorizontalSpmmKernel<SparseRatioBase<1, 2>, 128, BlockShape, WarpShape, MmaShape, NStage,
-//             AccumulatorType, ASwizzle, BSwizzle, CSwizzle>;
-//     size_t shared_mem_size = max(KernelType::input_buffer_size, KernelType::output_buffer_size);
-//     cudaStream_t stream = NULL;
-//     int dim_x = m / KernelType::Block_M / M * N;
-//     int dim_y = n / KernelType::Block_N;
-//     _HorizontalSpmmDenseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
-//             m, n, k, A_values, A_metadata, A_indices, B, routing_weights, C, D);
-
+    using KernelType = HorizontalSpmmKernel<SparseRatioBase<1, 2>, 128, BlockShape, WarpShape, MmaShape, NStage,
+            AccumulatorType, ASwizzle, BSwizzle, CSwizzle>;
+    size_t shared_mem_size = max(KernelType::input_buffer_size, KernelType::output_buffer_size);
     cudaStream_t stream = NULL;
-    // Dispatch based on N, M
-    if (N == 1 && M == 4) {
-        using KernelType = HorizontalSpmmKernel<SparseRatioBase<1, 2>, 128, BlockShape, WarpShape, MmaShape, NStage,
-                AccumulatorType, ASwizzle, BSwizzle, CSwizzle>;
-        size_t shared_mem_size = max(KernelType::input_buffer_size, KernelType::output_buffer_size);
-        int dim_x = m / KernelType::Block_M / M * N;
-        int dim_y = (n + KernelType::Block_N - 1) / KernelType::Block_N;
-        _HorizontalSpmmDenseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
-                m, n, k, N, M, A_values, A_metadata, A_indices, B, routing_weights, C, D);
-    } else if (N == 2 && M == 4) {
-        using KernelType = HorizontalSpmmKernel<SparseRatioBase<2, 4>, 128, BlockShape, WarpShape, MmaShape, NStage,
-                AccumulatorType, ASwizzle, BSwizzle, CSwizzle>;
-        size_t shared_mem_size = max(KernelType::input_buffer_size, KernelType::output_buffer_size);
-        int dim_x = m / KernelType::Block_M / M * N;
-        int dim_y = (n + KernelType::Block_N - 1) / KernelType::Block_N;
-        _HorizontalSpmmDenseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
-                m, n, k, N, M, A_values, A_metadata, A_indices, B, routing_weights, C, D);
-    } else {
-        using KernelType = HorizontalSpmmKernel<SparseRatioBase<1, 2>, 128, BlockShape, WarpShape, MmaShape, NStage,
-                AccumulatorType, ASwizzle, BSwizzle, CSwizzle>;
-        size_t shared_mem_size = max(KernelType::input_buffer_size, KernelType::output_buffer_size);
-        int dim_x = m / KernelType::Block_M / M * N;
-        int dim_y = (n + KernelType::Block_N - 1) / KernelType::Block_N;
-        _HorizontalSpmmDenseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
-                m, n, k, N, M, A_values, A_metadata, A_indices, B, routing_weights, C, D);
-    }
+    int dim_x = m / KernelType::Block_M / M * N;
+    int dim_y = n / KernelType::Block_N;
+    printf("[HorizontalSpmmDenseWeightedTransKernelExec] N=%d, M=%d\n", N, M);
+    printf("[LAUNCH SPMM KERNEL] shared_mem=%zu, Block_M=%d, Block_N=%d, m=%d, n=%d, k=%d, dim_x=%d, dim_y=%d\n",
+       shared_mem_size, KernelType::Block_M, KernelType::Block_N, m, n, k, dim_x, dim_y);
+    _HorizontalSpmmDenseWeightedTransKernel<KernelType><<<dim3(dim_x, dim_y, 1), dim3(128, 1, 1), shared_mem_size, stream>>>(
+            m, n, k, A_values, A_metadata, A_indices, B, routing_weights, C, D);
 }
 
 

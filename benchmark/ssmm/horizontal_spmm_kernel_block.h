@@ -510,6 +510,10 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
                 // load A from GM to SM
                 // EXACT Dual-Storage: Check if 1:4 format needs expansion
                 if (N == 1 && M == 4) {
+                    if (threadIdx.x == 0 && blockIdx.x == 0 && fetch == 0) {
+                        printf("[SPMM KERNEL] Taking 1:4 expansion path, Block_K=%d, values_num_cols=%d\n",
+                            Block_K, values_num_cols);
+                    }
                     // Load compact 1:4 from GM, expand to 2:4 in SM for hardware execution
                     load_and_expand_1_4_to_2_4<ASwizzle, A_GM_TO_SM_CP_SIZE, 
                                                 A_GM_TO_SM_CP_ROWS_PER_ITER, 
@@ -695,11 +699,8 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     const int lane_id = threadIdx.x % THREADS_PER_WARP;
 
     // 计算实际的A相关数据
-    const int values_num_cols = k / SPTC_M * SPTC_N;
+    const int values_num_cols = k / logical_M * logical_N;  // Use actual N:M for correct column count
     const int metadata_num_cols = values_num_cols / NUM_OF_META_PER_UINT;
-    // Cold metadata is pre-expanded offline to hardware 2:4 layout,
-    // so runtime metadata stride matches the standard 2:4 path.
-    const int actual_metadata_cols = metadata_num_cols;
     // A_indice是转置的
     const int A_indices_num_rows = k / vector_length; // A_indices_row 代表有几组vector_length粒度的剪裁
     const int A_indices_num_cols = m / M * N; // indices_col 代表condense_A的行数
@@ -709,15 +710,13 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     const int warp_idx_M = warp_id % (Block_M / Warp_M);
     const int warp_idx_N = warp_id / (Block_M / Warp_M);
 
-    const int actual_storage_cols = (logical_N == 1 && logical_M == 4) 
-                                ? values_num_cols / 2  // 1:4 storage
-                                : values_num_cols;     // 2:4 storage
+    const int actual_storage_cols = values_num_cols;  // Already calculated with actual N:M
     // 计算当前block需要处理的数据(共64次计算)在GM中的偏移(以thread为单位的偏移)
     const half *A_panel = &A_values[
             (block_idx_M * Block_M + threadIdx.x / A_GM_TO_SM_CP_THREAD_PER_ROW) * actual_storage_cols +
             threadIdx.x % A_GM_TO_SM_CP_THREAD_PER_ROW * A_GM_TO_SM_CP_SIZE];
     const uint *A_I_panel = &A_indices[block_idx_M * Block_M];
-    const uint *M_panel = &A_metadata[(block_idx_M * Block_M) * actual_metadata_cols];
+    const uint *M_panel = &A_metadata[(block_idx_M * Block_M) * metadata_num_cols];
     // B数据的具体偏移需要根据B_indices来计算
     const half *B_panel = &B[(block_idx_N * Block_N) * k];
 
@@ -744,16 +743,6 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     CSwizzle cSwizzle;
 
     uint2 selected_A_Indices[mma_iter_M];
-    if (logical_N == 1 && logical_M == 4) {
-        // Cold path writes only slot0 in the expanded 2:4 payload.
-        // Pre-zero staged A buffers once so slot1 stays zero without per-fetch stores.
-        const int cold_a_stage_elems = A_tile_size * ThreadBlockStage;
-        for (int idx = threadIdx.x; idx < cold_a_stage_elems; idx += TOTAL_THREADS_PER_BLOCK) {
-            A_shared[idx] = __float2half(0.0f);
-        }
-        __syncthreads();
-    }
-
 
     // A_indices的加载，每prefetchIndicesStage个tile加载一次
     const int prefetchIndicesStage = indicesPrefetchBlock / Block_M * vector_length / Block_K;
@@ -765,19 +754,16 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
 #pragma unroll
     for (int compute = 0; compute < num_tiles; compute++) {
         if (logical_N == 1 && logical_M == 4) {
-            // 1:4 cold path: metadata is already expanded to 2:4 format offline.
+            // 1:4: Generate fixed metadata
             for (int i = 0; i < mma_iter_M; i++) {
-                load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
-                                               M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_metadata_cols +
-                                               warp_id * 16 * actual_metadata_cols + lane_id / 4 * actual_metadata_cols,
-                                               compute);
+                metaFragment[i].x[0] = 0x00010001;
             }
         } else { // 2:4: Load metadata from GM
             // load metadata to Fragment(GM->Fragment)
             for (int i = 0; i < mma_iter_M; i++) {
                 load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
-                                            M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_metadata_cols +
-                                            warp_id * 16 * actual_metadata_cols + lane_id / 4 * actual_metadata_cols,
+                                            M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
+                                            warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols,
                                             compute);
             }
         }
@@ -817,12 +803,12 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
                     //         Block_K, values_num_cols);
                     // }
                     // CRITICAL: Use block-level base pointer for 1:4
-                    // const half *A_block_base = &A_values[block_idx_M * Block_M * values_num_cols / 2];
+                    const half *A_block_base = &A_values[block_idx_M * Block_M * values_num_cols];
                     // Load compact 1:4 from GM, expand to 2:4 in SM for hardware execution
                     load_and_expand_1_4_to_2_4<ASwizzle, A_GM_TO_SM_CP_SIZE, 
                                                 A_GM_TO_SM_CP_ROWS_PER_ITER, 
                                                 TOTAL_THREADS_PER_BLOCK>(
-                        shared_tile_A, A_panel, values_num_cols / 2,  // 1:4 has half columns
+                        shared_tile_A, A_block_base, values_num_cols,  // actual 1:4 column count
                         fetch, Block_M, Block_K, threadIdx.x, aSwizzle
                     );
                 } else {

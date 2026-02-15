@@ -61,16 +61,15 @@ float2 half2_to_float2(const half2 v) {
 // ========================= EXACT: 1:4 to 2:4 expansion helper =========================
 
 /**
- * Load compact 1:4 values from global memory and expand into the 2:4 compute layout in shared memory.
- * Each expanded 2-value group is written as [val, 0]. The metadata path decides which absolute 0..3
- * position this pair corresponds to for sparse MMA.
+ * Load 1:4 sparse data from global memory and expand to 2:4 format in shared memory
+ * by duplicating each value. This enables true 1:4 storage while maintaining 2:4 hardware execution.
  * 
  * @param smem_tile Destination in shared memory (sized for 2:4 output)
  * @param gmem_panel Source in global memory (1:4 compact format)
- * @param values_num_cols_1_4 Number of compact value columns per row (k/4)
+ * @param values_num_cols_1_4 Number of columns in 1:4 format (k/4)
  * @param fetch Current tile index along K dimension
  * @param Block_M, Block_K Tile dimensions
- * @param threadIdx_x Thread index for parallel row-strided loading
+ * @param threadIdx Thread index for parallel loading
  * @param aSwizzle Shared memory swizzle function
  */
 template<typename ASwizzle, int A_GM_TO_SM_CP_SIZE, int A_GM_TO_SM_CP_ROWS_PER_ITER, int TOTAL_THREADS_PER_BLOCK>
@@ -80,59 +79,61 @@ void load_and_expand_1_4_to_2_4(half* smem_tile, const half* gmem_panel,
                                  const int Block_M, const int Block_K,
                                  const int threadIdx_x, ASwizzle aSwizzle) {
     const int input_cols_1_4 = Block_K / 4;
+    const int output_cols_2_4 = Block_K / 2;
 
+    // if (threadIdx_x == 0 && blockIdx.x == 0 && fetch == 0) {
+    //     printf("[EXPAND] input_cols_1_4=%d, output_cols_2_4=%d, Block_M=%d, values_num_cols_1_4=%d\n",
+    //         input_cols_1_4, output_cols_2_4, Block_M, values_num_cols_1_4);
+    // }
+    
     for (int row = threadIdx_x; row < Block_M; row += TOTAL_THREADS_PER_BLOCK) {
-#pragma unroll
         for (int col_1_4 = 0; col_1_4 < input_cols_1_4; col_1_4++) {
-            // Read one compact 1:4 value for (row, col_1_4) within this fetch tile.
+            // Read from 1:4 compact storage, expand to 2:4 format
             int src_idx = row * values_num_cols_1_4 + fetch * input_cols_1_4 + col_1_4;
             
             half val = gmem_panel[src_idx];
             
-            // Expand to one 2:4 pair in SM: local slot0 carries value.
-            // slot1 is pre-zeroed once per stage buffer by the caller.
-            // The metadata path maps this pair to absolute positions in the 4-wide group.
+            // Write duplicated to 2:4 positions for hardware execution
             int dst_base = row * (Block_K / 2) + col_1_4 * 2;
             smem_tile[aSwizzle(dst_base + 0)] = val;
+            smem_tile[aSwizzle(dst_base + 1)] = val;
+            
+            // if (threadIdx_x == 0 && blockIdx.x == 0 && fetch == 0 && row == 0 && col_1_4 == 0) {
+            //     printf("[EXPAND DEBUG] gmem_panel base ptr offset, row=%d, values_num_cols_1_4=%d, fetch=%d, src_idx=%d, val=%f\n",
+            //         row, values_num_cols_1_4, fetch, src_idx, __half2float(val));
+            //     printf("[EXPAND DEBUG] Block_K=%d, Block_K/2=%d, A_tile_size=%d\n",
+            //         Block_K, Block_K/2, Block_M * Block_K / 2);
+            //     printf("[EXPAND DEBUG] A_panel ptr=%p, offset 0 val=%f, offset 1 val=%f\n",
+            //         gmem_panel, __half2float(gmem_panel[0]), __half2float(gmem_panel[1]));
+            // }
         }
     }
     __syncthreads();
 }
 
-/**
- * Load compact 1:4 metadata (K/4 domain) and expand one 2:4 metadata word
- * (K/2 domain) for the current compute tile.
- *
- * A 1:4 uint contains 16 entries (2b each). A 2:4 uint consumes 8 entries
- * (4b per group), so one 1:4 uint serves two consecutive compute tiles.
- */
-__device__ __forceinline__
-void load_and_expand_meta_1_4_to_2_4(uint *__restrict__ dst,
-                                     const uint *base, const int compute) {
-    const int src_offset = compute >> 1;
-    const int use_upper_half = compute & 1;
-
-    uint meta_1_4 = base[src_offset];
-    if (use_upper_half) {
-        meta_1_4 >>= 16;
-    }
-
-    uint meta_2_4 = 0;
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const uint pos = (meta_1_4 >> (i * 2)) & 0x3;
-        // Emit explicit 2:4 absolute positions (first=real, second=zero buddy).
-        uint pair_bits;
-        switch (pos) {
-            case 0: pair_bits = 0u | (1u << 2); break; // (0,1)
-            case 1: pair_bits = 1u | (0u << 2); break; // (1,0)
-            case 2: pair_bits = 2u | (3u << 2); break; // (2,3)
-            default: pair_bits = 3u | (2u << 2); break; // (3,2)
-        }
-        meta_2_4 |= (pair_bits << (i * 4));
-    }
-    *dst = meta_2_4;
-}
+// template<typename ASwizzle, int A_GM_TO_SM_CP_SIZE, int A_GM_TO_SM_CP_ROWS_PER_ITER, int TOTAL_THREADS_PER_BLOCK>
+// __device__ __forceinline__
+// void load_and_expand_1_4_to_2_4(half* smem_tile, const half* gmem_block_base,
+//                                  const int values_num_cols_1_4, const int fetch,
+//                                  const int Block_M, const int Block_K,
+//                                  const int threadIdx_x, ASwizzle aSwizzle) {
+//     const int input_cols_1_4 = Block_K / 4;
+//     const int output_cols_2_4 = Block_K / 2;
+    
+//     for (int row = threadIdx_x; row < Block_M; row += TOTAL_THREADS_PER_BLOCK) {
+//         for (int col_1_4 = 0; col_1_4 < input_cols_1_4; col_1_4++) {
+//             // Read from 1:4 compact storage, expand to 2:4 format
+//             int src_idx = row * values_num_cols_1_4 + fetch * input_cols_1_4 + col_1_4;
+//             half val = gmem_block_base[src_idx];
+            
+//             // Write duplicated to 2:4 positions for hardware execution
+//             int dst_base = row * output_cols_2_4 + col_1_4 * 2;
+//             smem_tile[aSwizzle(dst_base + 0)] = val;
+//             smem_tile[aSwizzle(dst_base + 1)] = val;
+//         }
+//     }
+//     __syncthreads();
+// }
 
 // ========================= 下面是async的数据加载 =========================
 

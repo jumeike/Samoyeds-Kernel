@@ -99,6 +99,7 @@ struct HorizontalSsmmKernel {
 
     __device__ __forceinline__
     void mainLoop(const int m, const int n, const int k,
+                  const int logical_N, const int logical_M, // JU
                   const int brow, const int mbrow,
                   const half *A_values, const uint *A_metadata, const uint *A_indices,
                   const half *B, const uint *B_indices, const uint B_indices_len,
@@ -106,6 +107,7 @@ struct HorizontalSsmmKernel {
 
     __device__ __forceinline__
     void mainLoopTrans(const int m, const int n, const int k,
+                  const int logical_N, const int logical_M, // JU
                   const int brow, const int mbrow,
                   const half *A_values, const uint *A_metadata, const uint *A_indices,
                   const half *B, const uint *B_indices, const uint B_indices_len,
@@ -134,6 +136,7 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
         ThreadBlockStage, AccumulatorType,
         ASwizzle, BSwizzle, CSwizzle>::mainLoop
         (const int m, const int n, const int k,
+         const int logical_N, const int logical_M, // JU
          // const int vector_length, const int N, const int M,
          const int brow, const int mbrow,
          const half *A_values, const uint *A_metadata, const uint *A_indices,
@@ -154,10 +157,12 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     const int block_idx_N = blockIdx.y;
     const int warp_idx_M = warp_id % (Block_M / Warp_M);
     const int warp_idx_N = warp_id / (Block_M / Warp_M);
-
+    const int actual_storage_cols = (logical_N == 1 && logical_M == 4) 
+                                ? values_num_cols / 2  // 1:4 storage
+                                : values_num_cols;     // 2:4 storage
     // 计算当前block需要处理的数据(共64次计算)在GM中的偏移(以thread为单位的偏移)
     const half *A_panel = &A_values[
-            (block_idx_M * Block_M + threadIdx.x / A_GM_TO_SM_CP_THREAD_PER_ROW) * values_num_cols +
+            (block_idx_M * Block_M + threadIdx.x / A_GM_TO_SM_CP_THREAD_PER_ROW) * actual_storage_cols +
             threadIdx.x % A_GM_TO_SM_CP_THREAD_PER_ROW * A_GM_TO_SM_CP_SIZE];
     const uint *A_I_panel = &A_indices[block_idx_M * Block_M];
     const uint *M_panel = &A_metadata[(block_idx_M * Block_M) * metadata_num_cols];
@@ -210,17 +215,24 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
 
 #pragma unroll
     for (int compute = 0; compute < num_tiles; compute++) {
-        // load metadata to Fragment(GM->Fragment)
-        for (int i = 0; i < mma_iter_M; i++) {
-            // 这里与论文中的设计有所不同，在16行中，顺序应当是0、4、8、...、28、1、5、9、...、29
-            load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
-                                            M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
-                                            warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols +
-                                            lane_id % 2 * 8 * metadata_num_cols, compute);
-            // load_meta_gm_to_frag_sync_short(metaFragment[i].x,
-            //                                M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
-            //                                warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols,
-            //                                compute, (lane_id % 4) % 2, metadata_num_cols);
+        if (N == 1 && M == 4) {
+            // 1:4: Generate fixed metadata
+            for (int i = 0; i < mma_iter_M; i++) {
+                metaFragment[i].x[0] = 0x00010001;
+            }
+        } else { // 2:4: Load metadata from GM
+            // load metadata to Fragment(GM->Fragment)
+            for (int i = 0; i < mma_iter_M; i++) {
+                // 这里与论文中的设计有所不同，在16行中，顺序应当是0、4、8、...、28、1、5、9、...、29
+                load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
+                                                M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
+                                                warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols +
+                                                lane_id % 2 * 8 * metadata_num_cols, compute);
+                // load_meta_gm_to_frag_sync_short(metaFragment[i].x,
+                //                                M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
+                //                                warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols,
+                //                                compute, (lane_id % 4) % 2, metadata_num_cols);
+            }
         }
 
 #pragma unroll
@@ -257,7 +269,7 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
                 for (int i = 0; i < A_copy_iter; i++) {
                     // 每次fetch向右偏移A_tile_size / Block_M = Block_K / 2
                     const half *src =
-                            A_panel + fetch * A_tile_size / Block_M + i * A_GM_TO_SM_CP_ROWS_PER_ITER * values_num_cols;
+                            A_panel + fetch * A_tile_size / Block_M + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_storage_cols;
                     half *dst = shared_tile_A + aSwizzle(threadIdx.x * A_tile_size / A_copy_iter / TOTAL_THREADS_PER_BLOCK +
                                                          i * A_GM_TO_SM_CP_ROWS_PER_ITER * Block_K * SPTC_N / SPTC_M);
                     // 拷贝时以byte为单位，但是dst和src的指针是half类型
@@ -395,10 +407,15 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
         ThreadBlockStage, AccumulatorType,
         ASwizzle, BSwizzle, CSwizzle>::mainLoopTrans
         (const int m, const int n, const int k,
+         const int logical_N, const int logical_M, // JU
          const int brow, const int mbrow,
          const half *A_values, const uint *A_metadata, const uint *A_indices,
          const half *B, const uint *B_indices, const uint B_indices_len,
          half *shared_mem_workspace, const bool silu) {
+    
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //     printf("[SSMM KERNEL ENTRY] N=%d, M=%d\n", N, M);
+    // }
 
     const int warp_id = threadIdx.x / THREADS_PER_WARP;
     const int lane_id = threadIdx.x % THREADS_PER_WARP;
@@ -415,12 +432,19 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     const int warp_idx_M = warp_id % (Block_M / Warp_M);
     const int warp_idx_N = warp_id / (Block_M / Warp_M);
 
+    const int actual_storage_cols = (logical_N == 1 && logical_M == 4) 
+                                ? values_num_cols / 2  // 1:4 storage
+                                : values_num_cols;     // 2:4 storage
+    // Cold metadata is pre-expanded offline to hardware 2:4 layout,
+    // so runtime metadata stride matches the standard 2:4 path.
+    const int actual_metadata_cols = metadata_num_cols;
+
     // 计算当前block需要处理的数据(共64次计算)在GM中的偏移(以thread为单位的偏移)
     const half *A_panel = &A_values[
-            (block_idx_M * Block_M + threadIdx.x / A_GM_TO_SM_CP_THREAD_PER_ROW) * values_num_cols +
+            (block_idx_M * Block_M + threadIdx.x / A_GM_TO_SM_CP_THREAD_PER_ROW) * actual_storage_cols +
             threadIdx.x % A_GM_TO_SM_CP_THREAD_PER_ROW * A_GM_TO_SM_CP_SIZE];
     const uint *A_I_panel = &A_indices[block_idx_M * Block_M];
-    const uint *M_panel = &A_metadata[(block_idx_M * Block_M) * metadata_num_cols];
+    const uint *M_panel = &A_metadata[(block_idx_M * Block_M) * actual_metadata_cols];
     // B数据的具体偏移需要根据B_indices来计算
     // const half *B_panel = &B[(block_idx_N * Block_N) * k];
     const uint *B_I_panel = &B_indices[block_idx_N * Block_N];
@@ -461,6 +485,16 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     }
     __syncthreads();
 
+    if (logical_N == 1 && logical_M == 4) {
+        // Cold path writes only slot0 in the expanded 2:4 payload.
+        // Pre-zero staged A buffers once so slot1 stays zero without per-fetch stores.
+        const int cold_a_stage_elems = A_tile_size * ThreadBlockStage;
+        for (int idx = threadIdx.x; idx < cold_a_stage_elems; idx += TOTAL_THREADS_PER_BLOCK) {
+            A_shared[idx] = __float2half(0.0f);
+        }
+        __syncthreads();
+    }
+
     // A_indices的加载，每prefetchIndicesStage个tile加载一次
     const int prefetchIndicesStage = indicesPrefetchBlock / Block_M * vector_length / Block_K;
     int fetch_indices = 0;
@@ -470,12 +504,22 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
 
 #pragma unroll
     for (int compute = 0; compute < num_tiles; compute++) {
-        // load metadata to Fragment(GM->Fragment)
-        for (int i = 0; i < mma_iter_M; i++) {
-            load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
-                                           M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
-                                           warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols,
-                                           compute);
+        if (logical_N == 1 && logical_M == 4) {
+            // 1:4 cold path: metadata is already expanded to 2:4 format offline.
+            for (int i = 0; i < mma_iter_M; i++) {
+                load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
+                                               M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_metadata_cols +
+                                               warp_id * 16 * actual_metadata_cols + lane_id / 4 * actual_metadata_cols,
+                                               compute);
+            }
+        } else { // 2:4: Load metadata from GM
+            // load metadata to Fragment(GM->Fragment)
+            for (int i = 0; i < mma_iter_M; i++) {
+                load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
+                                            M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * metadata_num_cols +
+                                            warp_id * 16 * metadata_num_cols + lane_id / 4 * metadata_num_cols,
+                                            compute);
+            }
         }
 
 #pragma unroll
@@ -506,18 +550,38 @@ void HorizontalSsmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
                 half *shared_tile_B = B_shared + (fetch % NStage) * B_tile_size;
 
                 // load A from GM to SM
-                // 每个线程加载A_tile_size/TOTAL_THREADS_PER_BLOCK个half，一次加载A_GM_TO_SM_CP_SIZE个half
-                const int A_copy_iter = A_tile_size / TOTAL_THREADS_PER_BLOCK / A_GM_TO_SM_CP_SIZE;
+                // EXACT Dual-Storage: Check if 1:4 format needs expansion
+                if (logical_N == 1 && logical_M == 4) {
+                // if (SparseRatio::N == 1 && SparseRatio::M == 4) {
+                    // if (threadIdx.x == 0 && blockIdx.x == 0 && fetch == 0) {
+                    //     printf("[SSMM KERNEL] Taking 1:4 expansion path, Block_K=%d, values_num_cols=%d\n",
+                    //         Block_K, values_num_cols);
+                    // }
+                    // CRITICAL: Use block-level base pointer for 1:4
+                    // const half *A_block_base = &A_values[block_idx_M * Block_M * values_num_cols / 2];
+                    
+                    // Load compact 1:4 from GM, expand to 2:4 in SM for hardware execution
+                    load_and_expand_1_4_to_2_4<ASwizzle, A_GM_TO_SM_CP_SIZE, 
+                                                A_GM_TO_SM_CP_ROWS_PER_ITER, 
+                                                TOTAL_THREADS_PER_BLOCK>(
+                        shared_tile_A, A_panel, values_num_cols / 2, // compact 1:4 has half the columns
+                        fetch, Block_M, Block_K, threadIdx.x, aSwizzle
+                    );
+                } else {
+                    // Standard 2:4 load (Samoyeds baseline, backward compatible)
+                    // 每个线程加载A_tile_size/TOTAL_THREADS_PER_BLOCK个half，一次加载A_GM_TO_SM_CP_SIZE个half
+                    const int A_copy_iter = A_tile_size / TOTAL_THREADS_PER_BLOCK / A_GM_TO_SM_CP_SIZE;
 #pragma unroll
-                for (int i = 0; i < A_copy_iter; i++) {
-                    // 每次fetch向右偏移A_tile_size / Block_M = Block_K / 2
-                    const half *src =
-                            A_panel + fetch * A_tile_size / Block_M + i * A_GM_TO_SM_CP_ROWS_PER_ITER * values_num_cols;
-                    half *dst = shared_tile_A + aSwizzle(threadIdx.x * A_tile_size / A_copy_iter / TOTAL_THREADS_PER_BLOCK +
-                                                         i * A_GM_TO_SM_CP_ROWS_PER_ITER * Block_K * SPTC_N / SPTC_M);
-                    // 拷贝时以byte为单位，但是dst和src的指针是half类型
-                    // 一次拷贝16个byte，相当于8个half
-                    cp_gm_to_sm_async_zfill<A_GM_TO_SM_CP_SIZE * sizeof(half)>(dst, src);
+                    for (int i = 0; i < A_copy_iter; i++) {
+                        // 每次fetch向右偏移A_tile_size / Block_M = Block_K / 2
+                        const half *src =
+                                A_panel + fetch * A_tile_size / Block_M + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_storage_cols;
+                        half *dst = shared_tile_A + aSwizzle(threadIdx.x * A_tile_size / A_copy_iter / TOTAL_THREADS_PER_BLOCK +
+                                                             i * A_GM_TO_SM_CP_ROWS_PER_ITER * Block_K * SPTC_N / SPTC_M);
+                        // 拷贝时以byte为单位，但是dst和src的指针是half类型
+                        // 一次拷贝16个byte，相当于8个half
+                        cp_gm_to_sm_async_zfill<A_GM_TO_SM_CP_SIZE * sizeof(half)>(dst, src);
+                    }
                 }
 
                 // load B from GM to SM

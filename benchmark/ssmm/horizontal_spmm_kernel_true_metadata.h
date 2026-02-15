@@ -697,9 +697,9 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     // 计算实际的A相关数据
     const int values_num_cols = k / SPTC_M * SPTC_N;
     const int metadata_num_cols = values_num_cols / NUM_OF_META_PER_UINT;
-    // Cold metadata is pre-expanded offline to hardware 2:4 layout,
-    // so runtime metadata stride matches the standard 2:4 path.
-    const int actual_metadata_cols = metadata_num_cols;
+    const int actual_metadata_cols = (logical_N == 1 && logical_M == 4)
+                                ? metadata_num_cols / 2  // K/4 metadata for 1:4
+                                : metadata_num_cols;     // K/2 metadata for 2:4
     // A_indice是转置的
     const int A_indices_num_rows = k / vector_length; // A_indices_row 代表有几组vector_length粒度的剪裁
     const int A_indices_num_cols = m / M * N; // indices_col 代表condense_A的行数
@@ -744,16 +744,6 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
     CSwizzle cSwizzle;
 
     uint2 selected_A_Indices[mma_iter_M];
-    if (logical_N == 1 && logical_M == 4) {
-        // Cold path writes only slot0 in the expanded 2:4 payload.
-        // Pre-zero staged A buffers once so slot1 stays zero without per-fetch stores.
-        const int cold_a_stage_elems = A_tile_size * ThreadBlockStage;
-        for (int idx = threadIdx.x; idx < cold_a_stage_elems; idx += TOTAL_THREADS_PER_BLOCK) {
-            A_shared[idx] = __float2half(0.0f);
-        }
-        __syncthreads();
-    }
-
 
     // A_indices的加载，每prefetchIndicesStage个tile加载一次
     const int prefetchIndicesStage = indicesPrefetchBlock / Block_M * vector_length / Block_K;
@@ -765,12 +755,16 @@ void HorizontalSpmmKernel<SparseRatio, VectorLength, BlockShape, WarpShape, MmaS
 #pragma unroll
     for (int compute = 0; compute < num_tiles; compute++) {
         if (logical_N == 1 && logical_M == 4) {
-            // 1:4 cold path: metadata is already expanded to 2:4 format offline.
+            // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && compute == 0) {
+            //     printf("[DBG SPMM 1:4 meta path] logical=(%d:%d) metadata_cols=%d actual_metadata_cols=%d\n",
+            //            logical_N, logical_M, metadata_num_cols, actual_metadata_cols);
+            // }
+            // 1:4: Load true cold metadata (K/4) and expand to SPTC 2:4 fragment format.
             for (int i = 0; i < mma_iter_M; i++) {
-                load_meta_gm_to_frag_sync_uint(metaFragment[i].x,
-                                               M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_metadata_cols +
-                                               warp_id * 16 * actual_metadata_cols + lane_id / 4 * actual_metadata_cols,
-                                               compute);
+                load_and_expand_meta_1_4_to_2_4(metaFragment[i].x,
+                                                M_panel + i * A_GM_TO_SM_CP_ROWS_PER_ITER * actual_metadata_cols +
+                                                warp_id * 16 * actual_metadata_cols + lane_id / 4 * actual_metadata_cols,
+                                                compute);
             }
         } else { // 2:4: Load metadata from GM
             // load metadata to Fragment(GM->Fragment)

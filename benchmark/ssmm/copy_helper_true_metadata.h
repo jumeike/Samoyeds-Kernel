@@ -82,18 +82,17 @@ void load_and_expand_1_4_to_2_4(half* smem_tile, const half* gmem_panel,
     const int input_cols_1_4 = Block_K / 4;
 
     for (int row = threadIdx_x; row < Block_M; row += TOTAL_THREADS_PER_BLOCK) {
-#pragma unroll
         for (int col_1_4 = 0; col_1_4 < input_cols_1_4; col_1_4++) {
             // Read one compact 1:4 value for (row, col_1_4) within this fetch tile.
             int src_idx = row * values_num_cols_1_4 + fetch * input_cols_1_4 + col_1_4;
             
             half val = gmem_panel[src_idx];
             
-            // Expand to one 2:4 pair in SM: local slot0 carries value.
-            // slot1 is pre-zeroed once per stage buffer by the caller.
-            // The metadata path maps this pair to absolute positions in the 4-wide group.
+            // Expand to one 2:4 pair in SM: local slot0 is zero, slot1 carries value.
+            // The metadata expander maps this pair to absolute positions in the 4-wide group.
             int dst_base = row * (Block_K / 2) + col_1_4 * 2;
-            smem_tile[aSwizzle(dst_base + 0)] = val;
+            smem_tile[aSwizzle(dst_base + 0)] = __float2half(0.0f);
+            smem_tile[aSwizzle(dst_base + 1)] = val;
         }
     }
     __syncthreads();
@@ -122,17 +121,42 @@ void load_and_expand_meta_1_4_to_2_4(uint *__restrict__ dst,
     for (int i = 0; i < 8; i++) {
         const uint pos = (meta_1_4 >> (i * 2)) & 0x3;
         // Emit explicit 2:4 absolute positions (first=real, second=zero buddy).
+        // Using switch keeps codegen simple and branchless after unroll.
         uint pair_bits;
         switch (pos) {
-            case 0: pair_bits = 0u | (1u << 2); break; // (0,1)
-            case 1: pair_bits = 1u | (0u << 2); break; // (1,0)
-            case 2: pair_bits = 2u | (3u << 2); break; // (2,3)
-            default: pair_bits = 3u | (2u << 2); break; // (3,2)
+            case 0: pair_bits = 1u | (0u << 2); break; // (1,0)
+            case 1: pair_bits = 0u | (1u << 2); break; // (0,1)
+            case 2: pair_bits = 3u | (2u << 2); break; // (3,2)
+            default: pair_bits = 2u | (3u << 2); break; // (2,3)
         }
         meta_2_4 |= (pair_bits << (i * 4));
     }
     *dst = meta_2_4;
 }
+
+// template<typename ASwizzle, int A_GM_TO_SM_CP_SIZE, int A_GM_TO_SM_CP_ROWS_PER_ITER, int TOTAL_THREADS_PER_BLOCK>
+// __device__ __forceinline__
+// void load_and_expand_1_4_to_2_4(half* smem_tile, const half* gmem_block_base,
+//                                  const int values_num_cols_1_4, const int fetch,
+//                                  const int Block_M, const int Block_K,
+//                                  const int threadIdx_x, ASwizzle aSwizzle) {
+//     const int input_cols_1_4 = Block_K / 4;
+//     const int output_cols_2_4 = Block_K / 2;
+    
+//     for (int row = threadIdx_x; row < Block_M; row += TOTAL_THREADS_PER_BLOCK) {
+//         for (int col_1_4 = 0; col_1_4 < input_cols_1_4; col_1_4++) {
+//             // Read from 1:4 compact storage, expand to 2:4 format
+//             int src_idx = row * values_num_cols_1_4 + fetch * input_cols_1_4 + col_1_4;
+//             half val = gmem_block_base[src_idx];
+            
+//             // Write duplicated to 2:4 positions for hardware execution
+//             int dst_base = row * output_cols_2_4 + col_1_4 * 2;
+//             smem_tile[aSwizzle(dst_base + 0)] = val;
+//             smem_tile[aSwizzle(dst_base + 1)] = val;
+//         }
+//     }
+//     __syncthreads();
+// }
 
 // ========================= 下面是async的数据加载 =========================
 
